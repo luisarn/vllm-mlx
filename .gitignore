@@ -95,3 +95,6 @@ temp/
 
 # MLX cache
 .mlx_cache/
+
+# Data files (reference audio, etc.)
+data/

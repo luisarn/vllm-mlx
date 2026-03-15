@@ -9,7 +9,7 @@ Provides:
 """
 
 from .stt import STTEngine, transcribe_audio
-from .tts import TTSEngine, generate_speech
+from .tts import TTSEngine, clone_voice, generate_speech
 from .processor import AudioProcessor, separate_voice
 
 __all__ = [
@@ -19,6 +19,7 @@ __all__ = [
     # TTS
     "TTSEngine",
     "generate_speech",
+    "clone_voice",
     # Processing
     "AudioProcessor",
     "separate_voice",

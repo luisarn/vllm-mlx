@@ -35,6 +35,9 @@ The server provides:
     - GET /v1/mcp/tools - List MCP tools
     - GET /v1/mcp/servers - MCP server status
     - POST /v1/mcp/execute - Execute MCP tool
+    - POST /v1/audio/speech - Text-to-Speech (TTS with voice cloning support)
+    - GET /v1/audio/voices - List available TTS voices
+    - POST /v1/audio/transcriptions - Speech-to-Text (transcription)
 """
 
 import argparse
@@ -49,9 +52,10 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -157,6 +161,9 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+
+# Default reference audio for TTS voice cloning
+_default_ref_audio: str | None = None
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -840,7 +847,6 @@ async def execute_mcp_tool(request: MCPExecuteRequest) -> MCPExecuteResponse:
 
 # Global audio engines (lazy loaded)
 _stt_engine = None
-_tts_engine = None
 
 
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(verify_api_key)])
@@ -910,24 +916,33 @@ async def create_transcription(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Global TTS engine cache (model_name -> engine)
+_tts_engines: dict[str, any] = {}
+
+
 @app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
 async def create_speech(
-    model: str = "kokoro",
-    input: str = "",
-    voice: str = "af_heart",
-    speed: float = 1.0,
-    response_format: str = "wav",
+    model: str = Form("kokoro"),
+    input: str = Form(""),
+    voice: str = Form("af_heart"),
+    speed: float = Form(1.0),
+    response_format: str = Form("wav"),
+    ref_audio: UploadFile | None = File(None),
 ):
     """
     Generate speech from text (OpenAI TTS API compatible).
 
     Supported models:
     - kokoro (fast, lightweight)
-    - chatterbox (multilingual, expressive)
+    - chatterbox (multilingual, expressive, voice cloning)
     - vibevoice (realtime)
     - voxcpm (Chinese/English)
+    - qwen3-tts (voice cloning, multilingual)
+
+    Voice cloning: For chatterbox and qwen3-tts models, upload a reference
+    audio file via `ref_audio` to clone that voice.
     """
-    global _tts_engine
+    global _tts_engines
 
     try:
         from .audio.tts import TTSEngine  # Lazy import - optional feature
@@ -940,16 +955,49 @@ async def create_speech(
             "chatterbox-4bit": "mlx-community/chatterbox-turbo-4bit",
             "vibevoice": "mlx-community/VibeVoice-Realtime-0.5B-4bit",
             "voxcpm": "mlx-community/VoxCPM1.5",
+            "qwen3-tts": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
         }
         model_name = model_map.get(model, model)
 
-        # Load engine if needed
-        if _tts_engine is None or _tts_engine.model_name != model_name:
-            _tts_engine = TTSEngine(model_name)
-            _tts_engine.load()
+        # Get or create engine for this model
+        engine = _tts_engines.get(model_name)
+        if engine is None:
+            engine = TTSEngine(model_name)
+            engine.load()
+            _tts_engines[model_name] = engine
 
-        audio = _tts_engine.generate(input, voice=voice, speed=speed)
-        audio_bytes = _tts_engine.to_bytes(audio, format=response_format)
+        # Handle reference audio for voice cloning
+        ref_audio_path = None
+        temp_file_created = False
+
+        if ref_audio is not None:
+            # Save uploaded file temporarily with correct extension
+            # Determine extension from filename or content type
+            original_filename = ref_audio.filename or "audio.wav"
+            suffix = Path(original_filename).suffix.lower()
+            if suffix not in [".wav", ".mp3", ".m4a", ".flac", ".ogg"]:
+                suffix = ".wav"  # Default fallback
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                content = await ref_audio.read()
+                tmp.write(content)
+                ref_audio_path = tmp.name
+                temp_file_created = True
+        elif _default_ref_audio is not None:
+            # Use default reference audio if set
+            ref_audio_path = _default_ref_audio
+            logger.debug(f"Using default reference audio: {ref_audio_path}")
+
+        try:
+            # Generate speech with optional voice cloning
+            audio = engine.generate(
+                input, voice=voice, speed=speed, ref_audio=ref_audio_path
+            )
+            audio_bytes = engine.to_bytes(audio, format=response_format)
+        finally:
+            # Clean up temp file only if we created one (not the default)
+            if temp_file_created and ref_audio_path and os.path.exists(ref_audio_path):
+                os.unlink(ref_audio_path)
 
         content_type = (
             "audio/wav" if response_format == "wav" else f"audio/{response_format}"
@@ -971,10 +1019,13 @@ async def list_voices(model: str = "kokoro"):
     """List available voices for a TTS model."""
     from .audio.tts import CHATTERBOX_VOICES, KOKORO_VOICES
 
-    if "kokoro" in model.lower():
+    model_lower = model.lower()
+    if "kokoro" in model_lower:
         return {"voices": KOKORO_VOICES}
-    elif "chatterbox" in model.lower():
+    elif "chatterbox" in model_lower:
         return {"voices": CHATTERBOX_VOICES}
+    elif "qwen3" in model_lower and "tts" in model_lower:
+        return {"voices": ["voice_clone"], "requires_ref_audio": True}
     else:
         return {"voices": ["default"]}
 
@@ -2214,6 +2265,12 @@ Examples:
         help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
     )
     parser.add_argument(
+        "--default-ref-audio",
+        type=str,
+        default=None,
+        help="Default reference audio file for TTS voice cloning (used when no ref_audio is uploaded)",
+    )
+    parser.add_argument(
         "--default-temperature",
         type=float,
         default=None,
@@ -2230,13 +2287,19 @@ Examples:
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
-    global _default_temperature, _default_top_p
+    global _default_temperature, _default_top_p, _default_ref_audio
     _api_key = args.api_key
     _default_timeout = args.timeout
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    if args.default_ref_audio is not None:
+        if not os.path.exists(args.default_ref_audio):
+            print(f"Error: Default reference audio file not found: {args.default_ref_audio}")
+            sys.exit(1)
+        _default_ref_audio = args.default_ref_audio
+        logger.info(f"Default reference audio set: {_default_ref_audio}")
 
     # Configure rate limiter
     if args.rate_limit > 0:

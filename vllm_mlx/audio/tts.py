@@ -4,9 +4,10 @@ Text-to-Speech (TTS) engine using mlx-audio.
 
 Supports:
 - Kokoro (fast, lightweight)
-- Chatterbox (multilingual, expressive)
+- Chatterbox (multilingual, expressive, voice cloning)
 - VibeVoice (realtime, low latency)
 - VoxCPM (Chinese/English, high quality)
+- Qwen3-TTS (voice cloning, multilingual)
 """
 
 import io
@@ -58,6 +59,12 @@ class TTSEngine:
         engine.load()
         audio = engine.generate("Hello world!", voice="af_heart")
         engine.save(audio, "output.wav")
+
+    Voice Cloning (Qwen3-TTS):
+        engine = TTSEngine("mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16")
+        engine.load()
+        audio = engine.generate("Hello world!", ref_audio="reference_voice.wav")
+        engine.save(audio, "output.wav")
     """
 
     def __init__(
@@ -73,6 +80,7 @@ class TTSEngine:
                 - Chatterbox: mlx-community/chatterbox-turbo-fp16
                 - VibeVoice: mlx-community/VibeVoice-Realtime-0.5B-4bit
                 - VoxCPM: mlx-community/VoxCPM1.5
+                - Qwen3-TTS: mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16 (voice cloning)
         """
         self.model_name = model_name
         self.model = None
@@ -94,6 +102,8 @@ class TTSEngine:
             return "csm"
         elif "cosyvoice" in name_lower:
             return "cosyvoice"
+        elif "qwen3" in name_lower and "tts" in name_lower:
+            return "qwen3_tts"
         else:
             return "kokoro"  # Default
 
@@ -122,6 +132,7 @@ class TTSEngine:
         voice: str = "af_heart",
         speed: float = 1.0,
         lang_code: str = "a",
+        ref_audio: Union[str, np.ndarray, None] = None,
     ) -> AudioOutput:
         """
         Generate speech from text.
@@ -131,6 +142,7 @@ class TTSEngine:
             voice: Voice ID (model-specific)
             speed: Speech speed (0.5 to 2.0)
             lang_code: Language code (a=English, e=Spanish, f=French, etc.)
+            ref_audio: Reference audio for voice cloning models (Qwen3-TTS, Chatterbox)
 
         Returns:
             AudioOutput with audio data and metadata
@@ -144,12 +156,19 @@ class TTSEngine:
             audio_chunks = []
             sample_rate = 24000  # Default for most models
 
-            for result in self.model.generate(
-                text=text,
-                voice=voice,
-                speed=speed,
-                lang_code=lang_code,
-            ):
+            # Build generation kwargs based on model family
+            gen_kwargs = {
+                "text": text,
+                "voice": voice,
+                "speed": speed,
+                "lang_code": lang_code,
+            }
+
+            # Add ref_audio for voice cloning models
+            if ref_audio is not None and self._model_family in ("qwen3_tts", "chatterbox"):
+                gen_kwargs["ref_audio"] = ref_audio
+
+            for result in self.model.generate(**gen_kwargs):
                 audio_data = result.audio
                 if hasattr(result, "sample_rate"):
                     sample_rate = result.sample_rate
@@ -282,6 +301,8 @@ class TTSEngine:
             return KOKORO_VOICES
         elif self._model_family == "chatterbox":
             return CHATTERBOX_VOICES
+        elif self._model_family == "qwen3_tts":
+            return ["voice_clone"]  # Uses ref_audio for voice cloning
         else:
             return ["default"]
 
@@ -297,6 +318,7 @@ def generate_speech(
     model_name: str = DEFAULT_TTS_MODEL,
     voice: str = "af_heart",
     speed: float = 1.0,
+    ref_audio: Union[str, np.ndarray, None] = None,
 ) -> AudioOutput:
     """
     Convenience function to generate speech without managing engine.
@@ -306,10 +328,39 @@ def generate_speech(
         model_name: Model to use
         voice: Voice ID
         speed: Speech speed
+        ref_audio: Reference audio for voice cloning models (Qwen3-TTS)
 
     Returns:
         AudioOutput
     """
     engine = TTSEngine(model_name)
     engine.load()
-    return engine.generate(text, voice=voice, speed=speed)
+    return engine.generate(text, voice=voice, speed=speed, ref_audio=ref_audio)
+
+
+def clone_voice(
+    text: str,
+    ref_audio: Union[str, np.ndarray],
+    model_name: str = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
+    speed: float = 1.0,
+) -> AudioOutput:
+    """
+    Convenience function for voice cloning TTS.
+
+    Args:
+        text: Text to synthesize
+        ref_audio: Reference audio file path or numpy array to clone voice from
+        model_name: Voice cloning model to use (default: Qwen3-TTS)
+        speed: Speech speed
+
+    Returns:
+        AudioOutput with cloned voice
+
+    Example:
+        >>> audio = clone_voice("Hello world!", "my_voice.wav")
+        >>> engine = TTSEngine()
+        >>> engine.save(audio, "output.wav")
+    """
+    engine = TTSEngine(model_name)
+    engine.load()
+    return engine.generate(text, ref_audio=ref_audio, speed=speed)

@@ -119,6 +119,14 @@ def serve_command(args):
         server.load_embedding_model(args.embedding_model, lock=True)
         print(f"Embedding model loaded: {args.embedding_model}")
 
+    # Set default reference audio for TTS if specified
+    if args.default_ref_audio:
+        if not os.path.exists(args.default_ref_audio):
+            print(f"Error: Default reference audio file not found: {args.default_ref_audio}")
+            sys.exit(1)
+        server._default_ref_audio = args.default_ref_audio
+        print(f"Default reference audio set: {args.default_ref_audio}")
+
     # Build scheduler config for batched mode
     scheduler_config = None
     if args.continuous_batching:
@@ -826,6 +834,13 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    # Default reference audio for TTS voice cloning
+    serve_parser.add_argument(
+        "--default-ref-audio",
+        type=str,
+        default=None,
+        help="Default reference audio file for TTS voice cloning (used when no ref_audio is uploaded)",
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
