@@ -97,4 +97,4 @@ temp/
 .mlx_cache/
 
 # Data files (reference audio, etc.)
-data/
+#data/
